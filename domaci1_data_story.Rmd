@@ -1,0 +1,411 @@
+---
+title: "Domaći zadatak 1 - Data Story"
+subtitle: "Da li kasnjenje pri polasku predviđa kasnjenje pri dolasku - i koji su najgori krivci?"
+author: "Masa Uzelac RN 40/22"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi        = 150
+)
+```
+
+```{r paketi}
+library(nycflights13)
+library(tidyverse)
+library(scales)
+library(ggridges)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# 1. Uvod
+
+## Istraživačko pitanje
+
+> **Da li kasnjenje pri polasku statistički značajno predviđa kasnjenje pri dolasku, i razlikuju li se avio-kompanije međusobno po prosečnom kašnjenju pri dolasku?**
+
+## Zašto je ovo pitanje zanimljivo?
+
+Svako ko je ikad sedio u avionu koji "čeka na pisti" zna da osećaj panike - "hoću li stići na transfer?". Intuicija govori da kasnjenje pri polasku direktno uzrokuje kasnjenje pri dolasku, ali je li to stvarno tako? I ako jeste - koliko? Da li avioni "nadoknađuju" izgubljeno vreme u vazduhu?
+
+Drugi deo pitanja je praktičniji: ako odgovor bude "da, kasnjenje se prenosi", koje avio-kompanije su najgori krivci? Ako odgovor bude "ne, kasnjenja se nadoknađuju", onda kasnjenje pri polasku nije toliki problem.
+
+- **Ako odgovor bude "da"** - putnici bi trebali aktivno birati kompanije sa manjim kašnjenjem pri polasku.
+- **Ako odgovor bude "ne"** - kasnjenje pri polasku je neugodan ali ne i katastrofalan signal za putnika.
+
+---
+
+# 2. Istraživanje podataka
+
+## Upoznavanje sa datasetom
+
+```{r pregled-podataka}
+# Dimenzije i struktura
+glimpse(flights)
+```
+
+Dataset `nycflights13::flights` sadrži **`r format(nrow(flights), big.mark = ".")` letova** iz tri njujorška aerodroma (JFK, LGA, EWR) tokom 2013. godine, sa `r ncol(flights)` varijabli.
+
+Za naše pitanje, relevantne varijable su:
+
+| Varijabla | Opis |
+|-----------|------|
+| `dep_delay` | Kasnjenje pri polasku (min); negativno = ranije |
+| `arr_delay` | Kasnjenje pri dolasku (min); negativno = ranije |
+| `carrier` | Kod avio-kompanije (2 slova) |
+| `origin` | Polazni aerodrom |
+
+```{r deskriptivna-statistika}
+flights %>%
+  select(dep_delay, arr_delay, carrier, origin) %>%
+  filter(!is.na(dep_delay), !is.na(arr_delay)) %>%
+  summarise(
+    n              = n(),
+    dep_mean       = mean(dep_delay),
+    dep_median     = median(dep_delay),
+    dep_sd         = sd(dep_delay),
+    dep_na         = sum(is.na(dep_delay)),
+    arr_mean       = mean(arr_delay),
+    arr_median     = median(arr_delay),
+    arr_sd         = sd(arr_delay)
+  ) %>%
+  kable(
+    col.names = c("N letova", "Avg dep delay", "Med dep delay",
+                  "SD dep delay", "NA dep", "Avg arr delay",
+                  "Med arr delay", "SD arr delay"),
+    digits = 2,
+    caption = "Deskriptivna statistika kašnjenja (minutama)"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+Šta primećujemo?
+
+Prosečno kašnjenje pri polasku iznosi oko 12.6 minuta, dok je kašnjenje pri dolasku nešto manje - oko 6.9 minuta. Zanimljivo je da su medijane (srednje vrednosti koje nisu podložne ekstremima) znatno niže ili čak negativne (-2 i -5), što nam govori da većina letova zapravo polazi i stiže malo ranije, ali mali broj letova sa ogromnim kašnjenjima (vidimo visoku standardnu devijaciju) značajno kvari prosek.
+
+```{r deskriptivna-po-kompaniji}
+# Proseci po avio-kompaniji, spojeni sa imenima
+flights %>%
+  filter(!is.na(arr_delay), !is.na(dep_delay)) %>%
+  left_join(airlines, by = "carrier") %>%
+  group_by(carrier, name) %>%
+  summarise(
+    n             = n(),
+    avg_dep_delay = mean(dep_delay),
+    avg_arr_delay = mean(arr_delay),
+    pct_on_time   = mean(arr_delay <= 0) * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_arr_delay)) %>%
+  kable(
+    col.names = c("Kod", "Kompanija", "N letova",
+                  "Avg polazak (min)", "Avg dolazak (min)", "% na vreme"),
+    digits    = 1,
+    caption   = "Prosečna kašnjenja po avio-kompaniji (sortirano po dolasku)"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(1:3, background = "#fde8e8")   # Top 3 najgori - crvenkasto
+```
+
+Analiza po kompanijama:
+
+Tabela jasno rangira kompanije od "najgorih" ka "najboljima". Na samom vrhu po kašnjenju u dolasku nalaze se Frontier Airlines (F9) i ExpressJet (EV) sa preko 20 minuta prosečnog kašnjenja. S druge strane, Hawaiian Airlines (HA) i Alaska Airlines (AS) ne samo da ne kasne, već u proseku stižu ranije (prosek je negativan). 
+
+## Vizualizacija 1 - Raspodela kašnjenja (dep vs arr)
+
+```{r viz1-raspodela, fig.height=5}
+# Pripremamo "tidy" format za dual histogram
+kasnjenja_long <- flights %>%
+  filter(!is.na(dep_delay), !is.na(arr_delay),
+         dep_delay > -60, dep_delay < 300,    # uklanjamo ekstremne outlajere
+         arr_delay > -80, arr_delay < 300) %>%
+  pivot_longer(cols = c(dep_delay, arr_delay),
+               names_to  = "tip",
+               values_to = "kasnjenje") %>%
+  mutate(tip = recode(tip,
+                      dep_delay = "Kasnjenje pri POLASKU",
+                      arr_delay = "Kasnjenje pri DOLASKU"))
+
+ggplot(kasnjenja_long, aes(x = kasnjenje, fill = tip)) +
+  geom_histogram(binwidth = 5, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray30", linewidth = 0.8) +
+  facet_wrap(~tip, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("#e07b54", "#5b8db8"), guide = "none") +
+  scale_x_continuous(breaks = seq(-60, 300, 30)) +
+  labs(
+    title    = "Većina letova polazi i stiže (malo) na vreme - ali rep kašnjenja je dugačak",
+    subtitle = "Raspodela kašnjenja pri polasku i dolasku, NYC aerodromi 2013.",
+    x        = "Kasnjenje (minutama; negativno = ranije od reda)",
+    y        = "Broj letova",
+    caption  = "Izvor: nycflights13 R paket | Isključeni ekstremi > 300 min i < -80 min"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(strip.text = element_text(face = "bold", size = 12))
+```
+
+**Komentar:** Obe raspodele su jako nakošene udesno (*right-skewed*) - ogromna većina letova polazi i stiže u roku od ±15 minuta, ali postoji dugačak "rep" teških kašnjenja i do 5+ sati. Interesantno, medijana kašnjenja pri dolasku je čak **negativna** (letovi u proseku stižu malo ranije nego što piše u redu vožnje). Ovo je prvi signal da avioni možda nadoknađuju neka kašnjenja tokom leta.
+
+## Vizualizacija 2 - Ko su najgori krivci?
+
+```{r viz2-kompanije, fig.height=7}
+# Proseci po kompaniji + ridgeline distribucija
+avg_po_kompaniji <- flights %>%
+  filter(!is.na(arr_delay)) %>%
+  left_join(airlines, by = "carrier") %>%
+  group_by(name) %>%
+  summarise(avg = mean(arr_delay), .groups = "drop")
+
+flights %>%
+  filter(!is.na(arr_delay), arr_delay > -60, arr_delay < 200) %>%
+  left_join(airlines, by = "carrier") %>%
+  left_join(avg_po_kompaniji, by = "name") %>%
+  mutate(name = fct_reorder(name, avg)) %>%
+  ggplot(aes(x = arr_delay, y = name, fill = avg)) +
+  geom_density_ridges(
+    alpha = 0.85, scale = 1.3,
+    quantile_lines = TRUE, quantiles = 2,
+    color = "white"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_fill_gradient2(
+    low      = "#3a7d44",
+    mid      = "#f5c242",
+    high     = "#c0392b",
+    midpoint = 0,
+    name     = "Prosečno\nkašnjenje (min)"
+  ) +
+  scale_x_continuous(breaks = seq(-60, 200, 30)) +
+  labs(
+    title    = "Frontier i ExpressJet kasne najviše - Hawaiian skoro uvek stiže na vreme",
+    subtitle = "Ridgeline distribucija kašnjenja pri dolasku po avio-kompaniji | Linija = medijana",
+    x        = "Kasnjenje pri dolasku (min)",
+    y        = NULL,
+    caption  = "Izvor: nycflights13 | Isključeni: arr_delay < -60 ili > 200 min"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+**Komentar:** Odmah se vidi da su kompanije različite - Hawaiian Airlines (HA) i Alaska Airlines (AS) imaju medijanu kašnjenja blizu nule ili negativnu, dok Frontier (F9) i SkyWest (OO) "vuku" distribuciju udesno. Sve kompanije imaju rep teških kašnjenja, ali visina i pozicija pika se razlikuju.
+
+---
+
+# 3. Provera pretpostavki
+
+Da bismo testirali razlike između kompanija, koristićemo `arr_delay` kao zavisnu varijablu i `carrier` kao grupu.
+
+## Histogram po grupama
+
+```{r pretpostavke-histogram, fig.height=8}
+# biramo 6 "interesantnih" kompanija 
+odabrane <- c("UA", "AA", "DL", "B6", "F9", "HA")
+
+flights %>%
+  filter(carrier %in% odabrane, !is.na(arr_delay),
+         arr_delay > -60, arr_delay < 200) %>%
+  left_join(airlines, by = "carrier") %>%
+  ggplot(aes(x = arr_delay, fill = carrier)) +
+  geom_histogram(binwidth = 10, color = "white", alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray30") +
+  facet_wrap(~name, ncol = 2, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2", guide = "none") +
+  labs(
+    title    = "Raspodela kašnjenja pri dolasku - izabrane kompanije",
+    subtitle = "Sve distribucije su nakošene udesno (ne-normalne)",
+    x = "Kasnjenje (min)", y = "Broj letova"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+**Komentar:** Ni jedna raspodela ne liči na normalnu - sve su nakošene udesno sa dugim repom kašnjenja. Ovo već nagoveštava da ANOVA nije prikladan test.
+
+## QQ plot po grupama
+
+```{r pretpostavke-qq, fig.height=8}
+flights %>%
+  filter(carrier %in% odabrane, !is.na(arr_delay)) %>%
+  left_join(airlines, by = "carrier") %>%
+  ggplot(aes(sample = arr_delay, color = carrier)) +
+  stat_qq(alpha = 0.3, size = 0.5) +
+  stat_qq_line(color = "black", linewidth = 0.8) +
+  facet_wrap(~name, ncol = 2, scales = "free") +
+  scale_color_brewer(palette = "Set2", guide = "none") +
+  labs(
+    title    = "QQ plotovi pokazuju sistemsko odstupanje od normalnosti",
+    subtitle = "Tačke prate liniju samo u sredini - repovi su teški (heavy tails)",
+    x = "Teorijski kvantili (normalna raspodela)",
+    y = "Empirijski kvantili kašnjenja"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+**Komentar:** QQ plotovi jasno pokazuju da tačke odstupaju od dijagonale, posebno u desnom repu - klasičan znak *heavy-tailed* (ne-normalne) raspodele.
+
+## Shapiro-Wilk test
+
+> **Napomena:** Shapiro-Wilk test je dizajniran za male uzorke (n < 5000). Kada imamo desetine hiljada opservacija, test će **uvek** biti statistički značajan - čak i za minimalna odstupanja koja su praktično beznačajna.
+
+```{r pretpostavke-shapiro}
+# Koristimo nasumičan uzorak od 4999 letova po kompaniji (max za shapiro.test)
+set.seed(42)
+
+shapiro_rezultati <- flights %>%
+  filter(carrier %in% odabrane, !is.na(arr_delay)) %>%
+  group_by(carrier) %>%
+  slice_head(n = 4999) %>%
+  summarise(
+    n       = n(),
+    W       = shapiro.test(arr_delay)$statistic,
+    p_value = shapiro.test(arr_delay)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(normalno = ifelse(p_value > 0.05, "✓ Da", "✗ Ne"))
+
+shapiro_rezultati %>%
+  kable(
+    col.names = c("Kompanija", "N uzorka", "W statistika", "p-vrednost", "Normalnost?"),
+    digits = 4,
+    caption = "Shapiro-Wilk test normalnosti po kompaniji (uzorak ≤ 4999)"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  column_spec(5, bold = TRUE,
+              color = ifelse(shapiro_rezultati$normalno == "✓ Da", "green", "red"))
+```
+
+## Zaključak o pretpostavkama
+
+Sva tri dijagnostička alata (histogram, QQ plot, Shapiro-Wilk) jednoglasno pokazuju da **raspodele kašnjenja nisu normalne** - nakošene su udesno i imaju teške repove.
+
+**Odluka:** Koristićemo **Kruskal-Wallis test** umesto ANOVA-e, jer je to neparametarski ekvivalent koji ne pretpostavlja normalnost. Kruskal-Wallis testira da li barem jedna grupa ima statistički različitu *centralnu tendenciju* (medijanu) od ostalih.
+
+---
+
+# 4. Analiza i glavni grafik
+
+## 4a. Statistički test
+
+### Kruskal-Wallis test - razlike između kompanija
+
+```{r test-kruskal}
+kruskal_rezultat <- kruskal.test(arr_delay ~ carrier, data = flights)
+print(kruskal_rezultat)
+```
+
+**Interpretacija za nestatičara:** Postoji statistički veoma značajna razlika u kašnjenjima pri dolasku između avio-kompanija (p < 0.001) - toliko malo je verovatno da su ove razlike slučajne da bismo mogli da testiramo ovaj eksperiment milionima puta i skoro nikad ne bismo dobili ovakav rezultat *slučajno*. Drugim rečima, **izbor avio-kompanije zaista utiče na to koliko ćete kasniti**.
+
+### Koliko kasnjenje pri polasku objašnjava kasnjenje pri dolasku?
+
+```{r korelacija}
+kor <- flights %>%
+  filter(!is.na(dep_delay), !is.na(arr_delay)) %>%
+  summarise(r = cor(dep_delay, arr_delay, method = "spearman"))
+
+cat("Spearman korelacija dep_delay ~ arr_delay:", round(kor$r, 3))
+```
+
+Spearmanova korelacija od **`r round(kor$r, 3)`** između kašnjenja pri polasku i dolasku je veoma jaka - letovi koji kasne pri polasku skoro uvek kasne i pri dolasku.
+
+---
+
+## 4b. Glavni grafik
+
+```{r glavni-grafik, fig.height=7, fig.width=11}
+# Kompletni podaci za sve kompanije
+summary_podaci <- flights %>%
+  filter(!is.na(arr_delay), !is.na(dep_delay)) %>%
+  left_join(airlines, by = "carrier") %>%
+  group_by(carrier, name) %>%
+  summarise(
+    n             = n(),
+    avg_arr       = mean(arr_delay),
+    med_arr       = median(arr_delay),
+    avg_dep       = mean(dep_delay),
+    pct_on_time   = mean(arr_delay <= 0) * 100,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Skraćujemo dugačka imena kompanija
+    kratko_ime = str_wrap(name, 15),
+    kratko_ime = fct_reorder(kratko_ime, avg_arr)
+  )
+
+ggplot(summary_podaci,
+       aes(x = kratko_ime, y = avg_arr, fill = avg_arr)) +
+  geom_col(width = 0.75, color = "white", linewidth = 0.3) +
+  geom_hline(yintercept = 0, color = "gray20", linewidth = 0.8) +
+  geom_point(aes(y = med_arr), shape = 23,
+             fill = "white", color = "gray20", size = 3) +
+  # Anotacija proseka i medijane
+  geom_text(aes(label = sprintf("%.1f", avg_arr),
+                vjust = ifelse(avg_arr >= 0, -0.5, 1.3)),
+            size = 3.5, fontface = "bold", color = "gray20") +
+  # Veličina tačke = procenat na vreme
+  scale_fill_gradient2(
+    low      = "#2d6a4f",
+    mid      = "#f4a261",
+    high     = "#c0392b",
+    midpoint = 5,
+    name     = "Prosečno\nkašnjenje (min)"
+  ) +
+  scale_y_continuous(
+    breaks = seq(-10, 25, 5),
+    labels = function(x) paste0(ifelse(x >= 0, "+", ""), x, " min"),
+    expand = expansion(mult = c(0.1, 0.2))
+  ) +
+  labs(
+    title    = "Frontier i ExpressJet kasne skoro pola sata - Hawaiian dolazi ranije nego što piše",
+    subtitle = "Prosečno kašnjenje pri dolasku po avio-kompaniji | ◇ = medijana kašnjenja\nNYC aerodromi (JFK, LGA, EWR), 2013. godina",
+    x        = NULL,
+    y        = "Prosečno kašnjenje pri dolasku (minutama)",
+    caption  = paste0(
+      "Izvor: nycflights13 R paket (CRAN) | N = ",
+      format(sum(summary_podaci$n), big.mark = "."), " letova\n",
+      "Kruskal-Wallis test: p < 0.001 - razlike između kompanija nisu slučajne"
+    )
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14, lineheight = 1.2),
+    plot.subtitle   = element_text(color = "gray40", size = 11),
+    plot.caption    = element_text(color = "gray50", size = 9, hjust = 0),
+    axis.text.x     = element_text(size = 9, lineheight = 1.1),
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  ) +
+  coord_flip()
+```
+
+---
+
+# 5. Zaključak
+
+## Šta smo našli?
+
+Analiza letova iz njujorškog vazdušnog prostora u 2013. godini daje jasan odgovor na oba dela istraživačkog pitanja. **Da - kasnjenje pri polasku je izuzetno jak prediktor kašnjenja pri dolasku** (Spearman r ≈ 0.63): avioni koji kasne pri polasku gotovo uvek kasne i pri dolasku, sa zanemarljivim "nadoknađivanjem" tokom leta. Istovremeno, **avio-kompanije se statistički značajno razlikuju** u prosečnim kašnjenjima pri dolasku (Kruskal-Wallis p < 0.001). Frontier Airlines i ExpressJet kasne u proseku 20–22 minuta, dok Hawaiian Airlines u proseku *stiže ranije* nego što piše u redu vožnje. Putnik koji bira između ovih kompanija ne bira samo cenu - bira i koliko će verovatno zakasniti na transfer.
+
+## Šta ostaje otvoreno?
+
+Ova analiza ima nekoliko ograničenja. Prvo, posmatramo samo **2013. godinu** iz samo **tri aerodroma** - rezultati možda nisu prenosivi na današnje letove ili na letove iz drugih vazdušnih prostora. Drugo, nismo kontrolisali za **dužinu rute**: Hawaiian Airlines leti pretežno duge transkontinentalne rute gde se kašnjenja lakše nadoknađuju, dok ExpressJet leti kratke regionalne rute sa manje "prostora za manevrisanje". Treće, nismo razdvajali letove po **sezoni** - zimski meseci gotovo sigurno imaju drugačiji profil kašnjenja od letnjih. Sa više podataka, zanimljivo bi bilo istražiti da li su kašnjenja sistemska (npr. uvek iste kompanije u istim mesecima) ili stohastična, i koji faktori (aerodrom, sat poletanja, tip aviona) najviše doprinose ekstremnim kašnjenjima.
+
+---
+

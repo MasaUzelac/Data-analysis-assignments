@@ -1,0 +1,790 @@
+---
+title: "Domaći zadatak 2 — Tri hipoteze"
+subtitle: "Statistička analiza ukusa, popularnosti i trendova kroz 59.325 parfema"
+author: "Masa Uzelac RN 40/22"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi        = 150
+)
+```
+
+```{r paketi}
+library(tidyverse)
+library(scales)
+library(ggridges)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(ggrepel)
+library(rstatix)
+```
+
+------------------------------------------------------------------------
+
+# 1. Uvod
+
+## Izvor podataka
+
+> **Parfumo** (`parfumo.com`) je najveća svetska zajednica ljubitelja parfema — beleži ocene, note i detalje za 59.325 parfema iz 1.451 parfemske kuće, pokrivajući period od 1709. do 2024. godine. Dataset je preuzet sa Kaggle platforme: [Parfumo Perfume Database — 59k Fragrances](https://www.kaggle.com/datasets/ibrahimqasimi/parfumo-perfume-database-59k-fragrances).
+
+Svaki red predstavlja jedan parfem. Relevantne varijable:
+
+| Varijabla | Tip | Opis |
+|-----------|-----|------|
+| `Rating_Value` | Numerička | Prosečna ocena zajednice (0–10) |
+| `Rating_Count` | Numerička | Broj korisnika koji su ocenili miris |
+| `Release_Year` | Numerička | Godina lansiranja; izvor za izvedenu `decade` |
+| `Top_Notes` / `Middle_Notes` / `Base_Notes` | Numerička (izvedena) | Broj nota po sloju — prebrojano i kodirano kao `note_count` za H2 vizualizaciju |
+| `Main_Accords` | Kategorijska | Dominantni aromatski akordi; izvor za izvedenu `first_accord` |
+| `first_accord` | Kategorijska (izvedena) | Dominantni akord (tekst pre prvog zareza); 8 kategorija; korišćena u H1 i H3 |
+| `decade` | Kategorijska (izvedena) | Dekada lansiranja iz `Release_Year`; 5 kategorija; korišćena u H3 |
+| `Name` / `Brand` | Tekstualna | Korišćeno samo za anotacije na H2 scatter plotu |
+
+## Tri istraživačka pitanja
+
+**Pitanje 1 — ANOVA / Kruskal-Wallis:** \> Da li mirisi iz različitih aromatskih kategorija (Floral, Woody, Spicy...) dobijaju statistički različite ocene Parfumo zajednice?
+
+**Pitanje 2 — Korelacija (Spearman):** \> Da li popularnost mirisa (broj glasača) korelira sa prosečnom ocenom — i šta nas raspored outlajera otkriva o "kult statusu" u svetu parfema?
+
+**Pitanje 3 — Hi-kvadrat:** \> Da li se distribucija dominantnih aromatskih akorda statistički značajno razlikuje između dekada lansiranja (1980-e do 2020-e)?
+
+## Zašto su ova pitanja zanimljiva?
+
+Ocene na Parfumo platformi potiču od ljubitelja mirisa koji svesno ocenjuju i kategorizuju svoja iskustva — što ih čini konzistentnim, ali i pristrasnim prema određenim stilovima.
+
+**Pitanje 1** istražuje da li postoji *aromatski prestiž*: da li zajednica sistematski favorizuje određene stilove (Woody, Spicy) nasuprot masovnim (Fruity, Fresh)? 
+
+**Pitanje 2** testira paradoks popularnosti — da li viralni parfemi zaslužuju svoju slavu, ili pravi "hidden gems" sa malo glasova nose najviše ocene? 
+
+**Pitanje 3** pita da li su aromatski trendovi koji se pominju u industriji (»oud boom«, »gourmand era«) stvarno statistički merljivi kroz istoriju.
+
+------------------------------------------------------------------------
+
+# 2. Priprema podataka
+
+```{r ucitavanje}
+parfumo_raw <- read_csv("~/Downloads/02_Parfumo_Perfumes.csv")
+glimpse(parfumo_raw)
+```
+
+```{r cistenje}
+parfumo <- parfumo_raw %>%
+  mutate(
+    Rating_Value = as.numeric(Rating_Value),
+    Rating_Count = as.numeric(Rating_Count),
+    Release_Year  = as.numeric(Release_Year),
+    # Dominantni akord = prvi u listi (pre prvog zareza)
+    first_accord  = str_trim(str_extract(Main_Accords, "^[^,]+")),
+    # Kategorijalna varijabla: dekada lansiranja
+    decade = case_when(
+      Release_Year >= 1980 & Release_Year < 1990 ~ "1980s",
+      Release_Year >= 1990 & Release_Year < 2000 ~ "1990s",
+      Release_Year >= 2000 & Release_Year < 2010 ~ "2000s",
+      Release_Year >= 2010 & Release_Year < 2020 ~ "2010s",
+      Release_Year >= 2020 & Release_Year <= 2024 ~ "2020s",
+      TRUE ~ NA_character_
+    ),
+    decade = factor(decade, levels = c("1980s","1990s","2000s","2010s","2020s"))
+  )
+
+# Top 8 aromatskih kategorija — definisano ovde da bude dostupno svuda
+top_accords <- parfumo %>%
+  filter(!is.na(first_accord), !is.na(Rating_Value),
+         first_accord != "Synthetic") %>%
+  count(first_accord, sort = TRUE) %>%
+  slice_head(n = 8) %>%
+  pull(first_accord)
+```
+
+```{r pregled-NA}
+tibble(
+  Varijabla   = c("Rating_Value","Rating_Count","Release_Year","first_accord","decade"),
+  Tip         = c("Numerička","Numerička","Numerička","Kategorijska","Kategorijska (izvedena)"),
+  Popunjeno   = c(
+    sum(!is.na(parfumo$Rating_Value)),
+    sum(!is.na(parfumo$Rating_Count)),
+    sum(!is.na(parfumo$Release_Year)),
+    sum(!is.na(parfumo$first_accord)),
+    sum(!is.na(parfumo$decade))
+  ),
+  `NA vrednosti` = c(
+    sum(is.na(parfumo$Rating_Value)),
+    sum(is.na(parfumo$Rating_Count)),
+    sum(is.na(parfumo$Release_Year)),
+    sum(is.na(parfumo$first_accord)),
+    sum(is.na(parfumo$decade))
+  )
+) %>%
+  kable(
+    caption  = "Pregled ključnih varijabli — broj popunjenih vrednosti i NA",
+    format.args = list(big.mark = ".")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"))
+```
+
+```{r summary-kljucnih}
+parfumo %>%
+  filter(!is.na(Rating_Value), !is.na(Rating_Count)) %>%
+  summarise(
+    `N parfema`         = n(),
+    `Min ocena`         = min(Rating_Value),
+    `Medijana ocene`    = median(Rating_Value),
+    `Prosek ocene`      = mean(Rating_Value),
+    `Max ocena`         = max(Rating_Value),
+    `Min glasova`       = min(Rating_Count),
+    `Medijana glasova`  = median(Rating_Count),
+    `Max glasova`       = max(Rating_Count)
+  ) %>%
+  kable(digits = 2, caption = "Deskriptivna statistika ocene i broja glasova") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"))
+```
+
+------------------------------------------------------------------------
+
+# 3. Analiza
+
+## 3.1 Pitanje 1: Aromatski prestiž — da li sve kategorije mirisa dobijaju jednake ocene?
+
+```{r h1-priprema}
+parfumo_h1 <- parfumo %>%
+  filter(first_accord %in% top_accords, !is.na(Rating_Value)) %>%
+  mutate(first_accord = fct_reorder(first_accord, Rating_Value, .fun = median))
+```
+
+### Motivaciona vizualizacija
+
+```{r h1-ridgeline, fig.height=8}
+ggplot(parfumo_h1,
+       aes(x = Rating_Value, y = first_accord, fill = after_stat(x))) +
+  geom_density_ridges_gradient(
+    scale          = 1.5,
+    quantile_lines = TRUE, quantiles = 2,
+    color          = "white", linewidth = 0.4,
+    rel_min_height = 0.01
+  ) +
+  scale_fill_gradientn(
+    colors = c("#2d6a4f","#95d5b2","#f9c74f","#f3722c","#c0392b"),
+    name   = "Ocena"
+  ) +
+  scale_x_continuous(limits = c(1, 10), breaks = seq(2, 10, 2)) +
+  labs(
+    title    = "Začinski i drveni mirisi sistematski nadmašuju voćne i sveže — razlika nije slučajna",
+    subtitle = "Distribucija prosečnih ocena (0–10) po dominantnoj aromatskoj kategoriji | Linija = medijana",
+    x        = "Prosečna ocena Parfumo zajednice (0–10)",
+    y        = NULL,
+    caption  = "Izvor: Parfumo.com — Parfumo Perfume Database (Kaggle) | Top 8 kategorija po broju ocenjenih parfema"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13, lineheight = 1.2),
+    plot.subtitle = element_text(color = "gray40", size = 11),
+    plot.caption  = element_text(color = "gray50", size = 9, hjust = 0),
+    legend.position = "right"
+  )
+```
+
+**Komentar:** Odmah se vidi da distribucije nisu identične — Spicy mirisi imaju vidljivo viši pik nego Fruity ili Fresh kategorije. Sve distribucije su asimetrične (nakošene ka nižim ocenama), što već sugeriše da ANOVA nije prikladna.
+
+------------------------------------------------------------------------
+
+### Provera pretpostavki
+
+#### Histogrami po kategoriji
+
+```{r h1-histogrami, fig.height=10}
+ggplot(parfumo_h1, aes(x = Rating_Value, fill = first_accord)) +
+  geom_histogram(binwidth = 0.5, color = "white", alpha = 0.9) +
+  geom_vline(xintercept = median(parfumo_h1$Rating_Value),
+             linetype = "dashed", color = "gray30", linewidth = 0.7) +
+  facet_wrap(~first_accord, ncol = 2, scales = "free_y") +
+  scale_fill_brewer(palette = "Set2", guide = "none") +
+  scale_x_continuous(breaks = seq(2, 10, 2)) +
+  labs(
+    title    = "Nijedna kategorija nema normalnu raspodelu — sve su nakošene ulevo",
+    subtitle = "Raspodela ocena po aromatskoj kategoriji | Isprekidana linija = globalna medijana",
+    x = "Ocena (0–10)", y = "Broj parfema"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text    = element_text(face = "bold"),
+    plot.title    = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40")
+  )
+```
+
+#### QQ plotovi
+
+```{r h1-qqplot, fig.height=10}
+ggplot(parfumo_h1, aes(sample = Rating_Value, color = first_accord)) +
+  stat_qq(alpha = 0.3, size = 0.5) +
+  stat_qq_line(color = "black", linewidth = 0.8) +
+  facet_wrap(~first_accord, ncol = 2, scales = "free") +
+  scale_color_brewer(palette = "Set2", guide = "none") +
+  labs(
+    title    = "QQ plotovi potvrđuju: svi repovi su teški i sistematski odstupaju od normalnosti",
+    subtitle = "Tačke prate liniju samo u sredini — levi rep je kraći, desni duži (asimetrija)",
+    x = "Teorijski kvantili (normalna raspodela)",
+    y = "Empirijski kvantili ocena"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text    = element_text(face = "bold"),
+    plot.title    = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "gray40")
+  )
+```
+
+**Komentar:** QQ plotovi potvrđuju ono što su histogrami nagovestili — tačke prate teorijsku liniju samo u sredini raspodele, dok oba repa sistemski skaču sa nje. Negde je levi rep kraći (nema mnogo parfema sa jako niskim ocenama), a desni duži. Ovo je klasičan znak asimetrične, ne-normalne raspodele.
+
+#### Shapiro-Wilk test
+
+> **Napomena:** Shapiro-Wilk test je pouzdan za n \< 5.000. Za veće grupe koristimo nasumičan podzuzorak (seed = 42 za reproduktivnost).
+
+```{r h1-shapiro}
+set.seed(42)
+
+shapiro_h1 <- parfumo_h1 %>%
+  group_by(first_accord) %>%
+  group_modify(~ slice_sample(.x, n = min(4999L, nrow(.x)))) %>%
+  summarise(
+    n         = n(),
+    W         = shapiro.test(Rating_Value)$statistic,
+    p_vrednost = shapiro.test(Rating_Value)$p.value,
+    .groups   = "drop"
+  ) %>%
+  mutate(normalnost = ifelse(p_vrednost > 0.05, "✓ Da", "✗ Ne"))
+
+shapiro_h1 %>%
+  kable(
+    col.names = c("Kategorija", "N uzorka", "W statistika", "p-vrednost", "Normalnost?"),
+    digits    = 4,
+    caption   = "Shapiro-Wilk test normalnosti po aromatskoj kategoriji (uzorak ≤ 4.999)"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  column_spec(5, bold = TRUE,
+              color = ifelse(shapiro_h1$normalnost == "✓ Da", "#27ae60", "#e74c3c"))
+```
+
+**Zaključak o pretpostavkama:** Sva tri dijagnostička alata — histogrami (nakošenost), QQ plotovi (teški repovi) i Shapiro-Wilk (p \< 0.001 svuda) — jednoglasno odbacuju normalnost. ANOVA nije prikladna. Koristićemo **Kruskal-Wallis test** kao neparametarsku alternativu koja ne zahteva normalnost.
+
+------------------------------------------------------------------------
+
+### Kruskal-Wallis test
+
+```{r h1-kruskal}
+kruskal_h1 <- kruskal.test(Rating_Value ~ first_accord, data = parfumo_h1)
+print(kruskal_h1)
+```
+
+**Komentar:** Kruskal-Wallis test potvrđuje da su razlike između kategorija statistički značajne — ali nam govori samo da "bar nešto nije isto", ne i koje konkretne kategorije se razlikuju jedna od druge. Za to nam treba post-hoc analiza.
+
+### Post-hoc analiza: Dunn test (Bonferroni korekcija)
+
+> **Šta je post-hoc i zašto Dunn test?** *Post-hoc* (lat. "nakon ovoga") je naziv za testove koji se rade **posle** glavnog testa kada on pokaže značajnost. Kruskal-Wallis kaže samo da su neke grupe različite, ali ne koje. Dunn test zatim poredi svaki par kategorija (8 kategorija = 28 parova: Spicy vs Fruity, Spicy vs Fresh, Woody vs Citrus...). Bonferroni korekcija postoji jer kada radimo 28 testova odjednom, statistički šum se akumulira — pa se prag za "značajno" strože postavlja da bismo izbegli lažne pozitivne rezultate.
+
+```{r h1-dunn}
+set.seed(42)
+dunn_h1 <- parfumo_h1 %>%
+  dunn_test(Rating_Value ~ first_accord, p.adjust.method = "bonferroni")
+
+# Sažetak: koliko parova se statistički značajno razlikuje
+dunn_h1 %>%
+  filter(p.adj < 0.05) %>%
+  select(group1, group2, statistic, p.adj) %>%
+  arrange(p.adj) %>%
+  slice_head(n = 10) %>%
+  mutate(p.adj = ifelse(p.adj < 0.0001, "< 0.0001", as.character(round(p.adj, 4)))) %>%
+  kable(
+    col.names = c("Grupa 1", "Grupa 2", "Z statistika", "p (adj., Bonf.)"),
+    caption = "Top 10 statistički značajnih parova — Dunn test sa Bonferroni korekcijom"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"))
+```
+
+**Komentar:** Tabela prikazuje samo statistički značajne parove (p < 0.05 nakon korekcije). Parovi sa najmanjim p-vrednostima predstavljaju najsigurnije razlike — npr. Spicy vs Fruity i Spicy vs Fresh su parovi gde su razlike u ocenama najizraženije i najteže objašnjive slučajnošću.
+
+### Vizualizacija rezultata
+
+```{r h1-finalni-grafik, fig.height=6}
+medijane_h1 <- parfumo_h1 %>%
+  group_by(first_accord) %>%
+  summarise(
+    n       = n(),
+    med     = median(Rating_Value),
+    q1      = quantile(Rating_Value, 0.25),
+    q3      = quantile(Rating_Value, 0.75),
+    .groups = "drop"
+  ) %>%
+  mutate(first_accord = fct_reorder(first_accord, med))
+
+ggplot(medijane_h1, aes(x = med, y = first_accord)) +
+  geom_segment(
+    aes(x = q1, xend = q3, yend = first_accord, color = med),
+    linewidth = 5, alpha = 0.4, lineend = "round"
+  ) +
+  geom_point(aes(color = med), size = 6) +
+  geom_text(
+    aes(label = sprintf("%.2f", med)),
+    hjust = -0.5, fontface = "bold", size = 4.2, color = "gray20"
+  ) +
+  geom_text(
+    aes(x = q1 - 0.05, label = paste0("n=", format(n, big.mark="."))),
+    hjust = 1.1, size = 3.2, color = "gray50"
+  ) +
+  scale_color_gradient2(
+    low = "#2d6a4f", mid = "#f9c74f", high = "#c0392b",
+    midpoint = 7.3, name = "Medijana\nocene"
+  ) +
+  scale_x_continuous(limits = c(6.0, 8.5), breaks = seq(6, 8.5, 0.5)) +
+  labs(
+    title    = "Spicy i Woody mirisi vode — Fruity i Fresh statistički zaostaju za ostalima",
+    subtitle = "Medijana ocene (tačka) i interkvartilni raspon (linija) | Kruskal-Wallis p < 0.001",
+    x        = "Medijana prosečne ocene (0–10)",
+    y        = NULL,
+    caption  = paste0(
+      "Kruskal-Wallis: χ² = ", round(kruskal_h1$statistic, 2),
+      ", df = ", kruskal_h1$parameter, ", p < 0.001",
+      " | Post-hoc: Dunn test, Bonferroni korekcija"
+    )
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13, lineheight = 1.2),
+    plot.subtitle = element_text(color = "gray40", size = 11),
+    plot.caption  = element_text(color = "gray50", size = 9, hjust = 0),
+    panel.grid.major.y = element_blank(),
+    legend.position = "right"
+  )
+```
+
+**Interpretacija:** Postoji statistički veoma značajna razlika u ocenama između aromatskih kategorija (p < 0.001). Začinski (Spicy) i drveni (Woody) mirisi dobijaju sistematski više ocene od voćnih (Fruity) i svežih (Fresh). Entuzijasti Parfumo zajednice favorizuju kompleksne, "teže" mirisne profile karakteristične za niche i prestiž brendove — naspram lakih, masovnih kategorija.
+
+> **Zaključak:** Na Parfumo platformi, začinski i drveni mirisi konzistentno dobijaju bolje ocene od voćnih i svežih — što govori da ova zajednica ceni teže, složenije mirise više od lakih i svežih.
+
+------------------------------------------------------------------------
+
+## 3.2 Pitanje 2: Popularnost ≠ kvalitet — ko su "hidden gems" Parfumo zajednice?
+
+```{r h2-priprema}
+# Prebrojavanje nota po parfemu (broj zareza + 1 za svaki neprazan sloj)
+count_notes <- function(x) {
+  ifelse(is.na(x) | str_trim(x) == "", 0L, str_count(x, ",") + 1L)
+}
+
+# Filtriramo na minimum 10 glasova (uklanjamo šum od jedne-dve ocene)
+parfumo_h2 <- parfumo %>%
+  filter(!is.na(Rating_Value), !is.na(Rating_Count), Rating_Count >= 10) %>%
+  mutate(
+    note_count = count_notes(Top_Notes) +
+                 count_notes(Middle_Notes) +
+                 count_notes(Base_Notes),
+    first_accord_h2 = ifelse(
+      first_accord %in% top_accords, first_accord, "Ostalo"
+    ) %>% replace_na("Ostalo")
+  )
+
+# Pragovi za zone — percentilni, ne ad-hoc
+q25_votes <- quantile(parfumo_h2$Rating_Count, 0.25)
+q75_votes <- quantile(parfumo_h2$Rating_Count, 0.75)
+p80_rating <- quantile(parfumo_h2$Rating_Value, 0.80)
+med_rating  <- median(parfumo_h2$Rating_Value)
+
+parfumo_h2 <- parfumo_h2 %>%
+  mutate(
+    zona = case_when(
+      Rating_Value >= p80_rating & Rating_Count <= q25_votes ~ "Hidden gem",
+      Rating_Value >= p80_rating & Rating_Count >= q75_votes ~ "Zasluženo popularan",
+      Rating_Value < med_rating  & Rating_Count >= q75_votes ~ "Overrated",
+      TRUE ~ "Prosek"
+    )
+  )
+```
+
+### Motivaciona vizualizacija i provera pretpostavki
+
+```{r h2-raspodele, fig.height=4}
+p_r <- ggplot(parfumo_h2, aes(x = Rating_Value)) +
+  geom_histogram(binwidth = 0.3, fill = "#3498db", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(parfumo_h2$Rating_Value),
+             linetype = "dashed", color = "gray30") +
+  labs(title = "Rating_Value — nakošena ulevo",
+       x = "Ocena", y = "N") +
+  theme_minimal(base_size = 11)
+
+p_v <- ggplot(parfumo_h2, aes(x = Rating_Count)) +
+  geom_histogram(bins = 60, fill = "#e67e22", color = "white", alpha = 0.85) +
+  scale_x_log10(labels = comma) +
+  labs(title = "Rating_Count — ekstremno desno nakošena (log skala)",
+       x = "Broj glasova (log₁₀)", y = "N") +
+  theme_minimal(base_size = 11)
+
+(p_r + p_v) +
+  plot_annotation(
+    title    = "Ni ocene ni glasovi nisu normalni — Spearman je jedini ispravan izbor",
+    subtitle = paste0(
+      "Rating_Value nakošen ulevo (medijana = ", round(med_rating, 2),
+      ") | Rating_Count ima ekstremno dugačak desni rep (max = ",
+      max(parfumo_h2$Rating_Count), " glasova)"
+    ),
+    theme = theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(color = "gray40", size = 10)
+    )
+  )
+```
+
+**Obrazloženje izbora Spearmana:** `Rating_Value` je nakošen ulevo, a `Rating_Count` ima ekstremno desno-nakošenu raspodelu sa outlajrima (do `r max(parfumo_h2$Rating_Count)` glasova). Pearsonova korelacija zahteva normalnost i linearnost — ovde ni jedno ne važi. Kendall-τ je konzervativniji i sporiji na velikom skupu. **Spearmanova korelacija** radi sa rangovima, robusna je na outlajere i nelinearne monotone veze.
+
+------------------------------------------------------------------------
+
+**Komentar:** Oba histograma potvrđuju da nijedna od varijabli nije normalno raspoređena. `Rating_Value` je nakošen ulevo — većina parfema ima relativno visoke ocene, što je tipično za platforme gde korisnici ocenjuju samo ono što su svesno izabrali i kupili. `Rating_Count` ima ekstremno dugačak desni rep — mali broj parfema ima stotine ili hiljade glasova, dok ih ogromna većina ima samo nekoliko desetina.
+
+### Spearman korelacija
+
+```{r h2-spearman}
+cor_h2 <- cor.test(
+  parfumo_h2$Rating_Count,
+  parfumo_h2$Rating_Value,
+  method = "spearman"
+)
+print(cor_h2)
+```
+
+**Komentar:** Spearmanova korelacija između broja glasova i ocene je slaba — što znači da popularnost i kvalitet (po mišljenju zajednice) ne idu nužno ruku pod ruku. LOESS kriva na scatter plotu pokazuje tek blagi pozitivni nagib, a raspršenost tačaka je velika na svim nivoima popularnosti.
+
+### Vizualizacija: mapa popularnosti i kult statusa
+
+```{r h2-scatter, fig.height=8, fig.width=11}
+# Top 12 "hidden gems" za labele
+top_gems <- parfumo_h2 %>%
+  filter(zona == "Hidden gem") %>%
+  arrange(desc(Rating_Value), desc(Rating_Count)) %>%
+  slice_head(n = 12)
+
+# Redosled i boje zona
+zona_boje  <- c(
+  "Hidden gem"    = "#27ae60",
+  "Zasluženo popularan" = "#2980b9",
+  "Overrated"           = "#e74c3c",
+  "Prosek"              = "gray80"
+)
+zona_alpha <- c(
+  "Hidden gem"    = 0.9,
+  "Zasluženo popularan" = 0.8,
+  "Overrated"           = 0.8,
+  "Prosek"              = 0.25
+)
+
+ggplot(parfumo_h2, aes(x = Rating_Count, y = Rating_Value)) +
+  # Pozadina: sive tačke za "Prosek"
+  geom_point(
+    data  = filter(parfumo_h2, zona == "Prosek"),
+    color = "gray82", size = 0.7, alpha = 0.3
+  ) +
+  # LOESS trend na celom skupu
+  geom_smooth(
+    method = "loess", span = 0.5,
+    color = "gray30", fill = "gray90",
+    linewidth = 1, alpha = 0.25
+  ) +
+  # Tačke zona — veličina = broj nota u kompoziciji
+  geom_point(
+    data  = filter(parfumo_h2, zona != "Prosek"),
+    aes(color = zona, size = note_count),
+    alpha = 0.75
+  ) +
+  # Labele hidden gems
+  geom_label_repel(
+    data         = top_gems,
+    aes(label = paste0(Name, "\n(", Brand, ")")),
+    size         = 2.8,
+    max.overlaps = 15,
+    box.padding  = 0.45,
+    label.padding = 0.25,
+    color        = "#1a1a2e",
+    fill         = alpha("white", 0.88),
+    segment.color = "#27ae60",
+    segment.size  = 0.4
+  ) +
+  # Vertikalne linije pragova
+  geom_vline(xintercept = q25_votes, linetype = "dotted", color = "gray50", linewidth = 0.6) +
+  geom_vline(xintercept = q75_votes, linetype = "dotted", color = "gray50", linewidth = 0.6) +
+  geom_hline(yintercept = p80_rating, linetype = "dotted", color = "gray50", linewidth = 0.6) +
+  # Anotacije pragova
+  annotate("text", x = q25_votes, y = 1.5,
+           label = paste0("Q25 glasova\n(", q25_votes, ")"),
+           size = 3, color = "gray40", hjust = 1.1) +
+  annotate("text", x = q75_votes, y = 1.5,
+           label = paste0("Q75 glasova\n(", q75_votes, ")"),
+           size = 3, color = "gray40", hjust = -0.1) +
+  annotate("text", x = max(parfumo_h2$Rating_Count) * 0.5,
+           y = p80_rating + 0.15,
+           label = paste0("80. percentil ocene (", round(p80_rating, 1), ")"),
+           size = 3, color = "gray40") +
+  scale_x_log10(labels = comma, breaks = c(10, 20, 50, 100, 200, 500, 1000, 2500)) +
+  scale_y_continuous(breaks = seq(2, 10, 1)) +
+  scale_color_manual(values = zona_boje, name = "Status parfema") +
+  scale_size_continuous(
+    name   = "Broj nota",
+    range  = c(1, 7),
+    breaks = c(0, 5, 10, 15, 20)
+  ) +
+  labs(
+    title    = "Parfemi sa 9+ ocenom i ispod 20 glasova su skoro isključivo artizanske niche kuće",
+    subtitle = paste0(
+      "Svaka tačka = jedan parfem (n = ", format(nrow(parfumo_h2), big.mark = "."),
+      " | min. 10 glasova) | x-osa: log₁₀ skala | veličina tačke = ukupan broj nota\n",
+      "Spearman ρ = ", round(cor_h2$estimate, 3), " — slaba pozitivna veza između popularnosti i ocene"
+    ),
+    x        = "Broj glasača (log skala)",
+    y        = "Prosečna ocena (0–10)",
+    caption  = "Izvor: Parfumo.com | Parfumo Perfume Database (Kaggle)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13, lineheight = 1.2),
+    plot.subtitle = element_text(color = "gray40", size = 10),
+    plot.caption  = element_text(color = "gray50", size = 9, hjust = 0),
+    legend.position = "bottom",
+    legend.title  = element_text(face = "bold")
+  )
+```
+
+```{r h2-zone-tabela}
+zona_tbl <- parfumo_h2 %>%
+  filter(zona != "Prosek") %>%
+  group_by(zona) %>%
+  summarise(
+    `Broj parfema`     = n(),
+    `Prosečna ocena`   = mean(Rating_Value),
+    `Medijana glasova` = median(Rating_Count),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(`Prosečna ocena`))
+
+gem_row <- which(zona_tbl$zona == "Hidden gem")
+
+zona_tbl %>%
+  kable(
+    digits  = 2,
+    caption = "Karakteristike parfema po statusu (isključeni parfemi u zoni 'Prosek')"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  row_spec(gem_row, background = "#d5f5e3")
+```
+
+```{r h2-top-gems-tabela}
+parfumo_h2 %>%
+  filter(zona == "Hidden gem") %>%
+  arrange(desc(Rating_Value), desc(Rating_Count)) %>%
+  slice_head(n = 10) %>%
+  mutate(
+    Name  = str_trunc(Name,  38, ellipsis = "..."),
+    Brand = str_trunc(Brand, 25, ellipsis = "...")
+  ) %>%
+  select(
+    `Naziv`   = Name,
+    `Brend`   = Brand,
+    `Ocena`   = Rating_Value,
+    `Glasova` = Rating_Count,
+    `Akord`   = first_accord_h2
+  ) %>%
+  kable(
+    format  = "html",
+    digits  = 1,
+    caption = "Top 10 'hidden gems' — najviša ocena uz najmanje glasova"
+  ) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE) %>%
+  column_spec(3, bold = TRUE, color = "#27ae60")
+```
+
+**Interpretacija:** Spearmanova korelacija između broja glasova i prosečne ocene je statistički značajna (p < 0.001), ali slaba (ρ ≈ `r round(cor_h2$estimate, 2)`). Popularnost i kvalitet nisu sinonimi u svetu parfema. Tabela otkriva da "hidden gems" dolaze iz dva različita izvora: specijalizovane niche oud kuće (poput Ensar Oud/Oriscent) i kultni vintage komadi klasičnih brendova (poput Miss Dior 1947 ili Parfum d'Hermès 1984) koji se više ne proizvode u originalnoj formi — poznaje ih mali krug poznavalaca koji ih i ocenjuje. Ovo je statistička potvrda da Parfumo zajednica podjednako vrednuje savremeni niche kvalitet i istorijsku parfumerijsku baštinu.
+
+> **Zaključak:** Koliko je parfem poznat i koliko ga zajednica ceni nisu ista stvar — najcenjeniji mirisi su uglavnom oni koje malo ko poznaje, bilo da su to retke niche kompozicije ili kultni klasici koji se više ne prave.
+
+------------------------------------------------------------------------
+
+## 3.3 Pitanje 3: Trendovi kroz dekade — da li je "Gourmand era" statistički merljiva?
+
+```{r h3-priprema}
+parfumo_h3 <- parfumo %>%
+  filter(
+    !is.na(decade),
+    !is.na(first_accord),
+    first_accord %in% top_accords
+  ) %>%
+  mutate(
+    first_accord = factor(first_accord, levels = top_accords),
+    decade       = droplevels(decade)
+  )
+```
+
+### Motivaciona vizualizacija
+
+```{r h3-stacked, fig.height=6}
+h3_prop <- parfumo_h3 %>%
+  count(decade, first_accord) %>%
+  group_by(decade) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(h3_prop, aes(x = decade, y = prop, fill = first_accord)) +
+  geom_col(position = "fill", color = "white", linewidth = 0.4) +
+  geom_text(
+    aes(label = ifelse(prop > 0.06, paste0(round(prop * 100), "%"), "")),
+    position = position_fill(vjust = 0.5),
+    size = 3.2, color = "white", fontface = "bold"
+  ) +
+  scale_y_continuous(labels = percent) +
+  scale_fill_brewer(palette = "Set2", name = "Dominantni akord") +
+  labs(
+    title    = "Sweet preuzima 2020-e — Spicy dominira 1980-e, Fresh ekspandira 2000-e",
+    subtitle = "Proporcionalna distribucija dominantnog akorda po dekadi lansiranja",
+    x        = "Dekada",
+    y        = "Udeo parfema (%)",
+    caption  = paste0(
+      "Izvor: Parfumo.com | n = ", format(nrow(parfumo_h3), big.mark = "."),
+      " parfema sa poznatim akordom i dekadoma | Top 8 kategorija"
+    )
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13, lineheight = 1.2),
+    plot.subtitle = element_text(color = "gray40", size = 11),
+    plot.caption  = element_text(color = "gray50", size = 9, hjust = 0),
+    legend.position = "bottom"
+  )
+```
+
+**Komentar:** Golim okom se vidi promena — Spicy je dominantniji u 1980-ima, Sweet skoro nestaje u 1980-ima pa eksplodira u 2020-ima, a Fresh raste u 2000-ima. Proveravamo da li su ove razlike statistički značajne ili slučajne fluktuacije.
+
+------------------------------------------------------------------------
+
+### Provera pretpostavki za hi-kvadrat
+
+```{r h3-pretpostavke}
+tabela_h3 <- table(parfumo_h3$first_accord, parfumo_h3$decade)
+
+ocekivane <- chisq.test(tabela_h3)$expected
+
+cat(sprintf(
+  "Minimalna očekivana frekvencija: %.1f\nProcenat ćelija sa očekivanom frekv. < 5: %.1f%%\n",
+  min(ocekivane),
+  mean(ocekivane < 5) * 100
+))
+```
+
+```{r h3-pretpostavke-tabela}
+as.data.frame.matrix(round(ocekivane, 1)) %>%
+  rownames_to_column("Akord") %>%
+  kable(caption = "Očekivane frekvencije po ćeliji — sve moraju biti ≥ 5 za valjanost hi-kvadrata") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed")) %>%
+  column_spec(1, bold = TRUE)
+```
+
+**Komentar:** Sve očekivane frekvencije su ≥ 5 — uslov za hi-kvadrat test je ispunjen. Da je neka ćelija imala očekivanu frekvenciju ispod 5, morali bismo da spojimo kategorije (npr. grupisati rede dekade) ili koristimo Fischerov egzaktni test.
+
+### Hi-kvadrat test nezavisnosti
+
+```{r h3-hisq}
+chisq_h3 <- chisq.test(tabela_h3)
+print(chisq_h3)
+```
+
+**Komentar:** Hi-kvadrat test nam govori da je veza između akorda i dekade statistički značajna — tj. distribucija mirisa po kategorijama nije ista kroz sve dekade. Ali sam test ne govori *gde* su razlike i *koje* kombinacije akord–dekada su nadprosečno ili ispodprosečno zastupljene. To otkriva vizualizacija reziduala ispod.
+
+### Vizualizacija Pearsonovih reziduala
+
+```{r h3-reziduali, fig.height=7}
+reziduali_df <- as.data.frame(chisq_h3$residuals) %>%
+  rename(accord = Var1, decade = Var2, residual = Freq) %>%
+  mutate(
+    residual_capped = pmin(pmax(residual, -15), 15),
+    label_txt       = round(residual, 1)
+  )
+
+ggplot(reziduali_df, aes(x = decade, y = accord, fill = residual_capped)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(
+    aes(label = label_txt,
+        color  = abs(residual) > 3),
+    size = 4.5, fontface = "bold"
+  ) +
+  scale_fill_gradient2(
+    low      = "#2166ac",
+    mid      = "white",
+    high     = "#d6604d",
+    midpoint = 0,
+    name     = "Pearson\nrezidual",
+    limits   = c(-15, 15)
+  ) +
+  scale_color_manual(
+    values = c("TRUE" = "gray10", "FALSE" = "gray50"),
+    guide  = "none"
+  ) +
+  scale_x_discrete(expand = expansion(0)) +
+  scale_y_discrete(expand = expansion(0)) +
+  labs(
+    title    = "Spicy je bio trend 1980-ih, Fresh 2000-ih — Sweet je eksplodirao tek u 2010-ima i 2020-ima",
+    subtitle = paste0(
+      "Pearsonovi reziduali: crveno = više nego slučajno očekivano | plavo = manje | ",
+      "|r| > 2 je statistički značajno"
+    ),
+    x        = "Dekada lansiranja",
+    y        = "Dominantni aromatski akord",
+    caption  = paste0(
+      "Hi-kvadrat test nezavisnosti: χ² = ", round(chisq_h3$statistic, 1),
+      ", df = ", chisq_h3$parameter,
+      ", p < 0.001 | Izvor: Parfumo.com"
+    )
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 13, lineheight = 1.2),
+    plot.subtitle = element_text(color = "gray40", size = 10),
+    plot.caption  = element_text(color = "gray50", size = 9, hjust = 0),
+    panel.grid    = element_blank(),
+    axis.text.x   = element_text(face = "bold", size = 12),
+    axis.text.y   = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Interpretacija:** Distribucija aromatskih akorda statistički značajno zavisi od dekade lansiranja (χ² = `r round(chisq_h3$statistic, 1)`, p < 0.001). Heatmap reziduala otkriva konkretne priče: Spicy i Green mirisi su bili natprosečno zastupljeni u 1980-ima (crvene ćelije), dok su gotovo nestali iz paleta 2020-ih. Fresh mirisi su imali procvat u 2000-ima (»aquatic era«). Sweet kategorija je statistički bila ispod očekivanja u ranim dekadama, a eksplodirala je u 2010-ima i 2020-ima — što je kvantitativna potvrda poznate »gourmand/sweet era« u industriji parfema.
+
+> **Zaključak:** Mirisni trendovi su se stvarno menjali kroz decenije i statistika to potvrđuje — 1980-e su dominantno začinske, 2000-e sveže, a 2020-e su jasno u znaku slatkih mirisa.
+
+------------------------------------------------------------------------
+
+# 4. Sinteza
+
+## Šta tri analize zajedno govore o svetu parfema?
+
+Tri pitanja zajedno crtaju konzistentnu sliku jedne specifične zajednice. Entuzijasti Parfumo platforme imaju jasne estetske preferencije — favorizuju Spicy i Woody mirise nad masovnim Sweet i Fruity kategorijama (Pitanje 1). Istovremeno, ta ista zajednica ocenjuje nezavisno od popularnosti: Spearmanova korelacija je statistički značajna ali slaba, a "hidden gems" (visoka ocena, malo glasova) su ili niche oud kuće ili kultni vintage komadi klasičnih brendova koji se više ne proizvode (Pitanje 2). Treća analiza dodaje istorijsku dimenziju — trendovi koji se pominju u parfumerijskim krugovima (»aquatic 90s«, »gourmand boom«) nisu PR narativ nego statistički merljiva promena u distribuciji akorda kroz dekade (Pitanje 3).
+
+## Koja analiza je bila najinformativnija?
+
+Najinformativnija je bila analiza Pearsonovih reziduala (Pitanje 3). Za razliku od Pitanja 1 — gde smo potvrdili očekivanu razliku u ocenama — i Pitanja 2 — gde smo kvantifikovali slabu vezu između glasova i ocene — heatmap reziduala daje konkretnu, vizualno čitljivu istorijsku narativnu: možemo direktno *locirati* u kojoj dekadi se koji akord probio, izgubio ili ostao stabilan. Ta granularnost je analitički najvrednija.
+
+## Jedna granica analize
+
+Dataset ne sadrži informacije o ceni parfema ni o tipu brenda (masovni tržišni vs. niche artizanski). Ovo je ključno ograničenje za Pitanje 1 i Pitanje 2: ne možemo razlučiti da li Parfumo zajednica više ceni Spicy i Woody mirise zbog aromatskog stila *per se*, ili zato što su ti mirisi statistički češće prisutni u premium/niche segmentu koji već ima predisponiranu publiku na platformi. Sa informacijom o ceni ili segmentu, analiza bi bila znatno kompletnija.
+
+------------------------------------------------------------------------
